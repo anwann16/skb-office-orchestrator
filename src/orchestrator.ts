@@ -1,11 +1,14 @@
 import os from "node:os";
 import path from "node:path";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  writeFile,
+} from "node:fs/promises";
 import { load } from "js-yaml";
-
-// ============================================================
-// CONFIG
-// ============================================================
 
 const AI_OFFICE = path.join(os.homedir(), "notes-brain", "Skb-Ai-Office");
 
@@ -15,11 +18,30 @@ const POLL_INTERVAL = 5000;
 
 type Agent = "FE" | "BE" | "QA";
 
-const runningTasks = new Set<string>();
+type TaskStatus =
+  | "backlog"
+  | "todo"
+  | "in-progress"
+  | "review"
+  | "qa"
+  | "blocked"
+  | "done";
 
-// ============================================================
-// TYPES
-// ============================================================
+const STATUS_FOLDERS: Record<TaskStatus, string> = {
+  backlog: "BACKLOG",
+  todo: "TODO",
+  "in-progress": "IN-PROGRESS",
+  review: "REVIEW",
+  qa: "QA",
+  blocked: "BLOCKED",
+  done: "DONE",
+};
+
+const VALID_STATUSES = new Set<TaskStatus>(
+  Object.keys(STATUS_FOLDERS) as TaskStatus[],
+);
+
+const runningTasks = new Set<string>();
 
 type TaskFrontmatter = {
   id?: string;
@@ -41,17 +63,13 @@ type Task = {
   body: string;
 };
 
-// ============================================================
-// AGENT VALIDATION
-// ============================================================
-
 function isAgent(value: string | undefined): value is Agent {
   return value === "FE" || value === "BE" || value === "QA";
 }
 
-// ============================================================
-// FRONTMATTER
-// ============================================================
+function isTaskStatus(value: string | undefined): value is TaskStatus {
+  return value !== undefined && VALID_STATUSES.has(value as TaskStatus);
+}
 
 function parseFrontmatter(content: string): {
   frontmatter: TaskFrontmatter;
@@ -60,7 +78,7 @@ function parseFrontmatter(content: string): {
   const match = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
 
   if (!match) {
-    throw new Error("Invalid markdown frontmatter");
+    throw new Error("Frontmatter Markdown tidak valid");
   }
 
   const frontmatter = load(match[1] ?? "") as TaskFrontmatter;
@@ -71,18 +89,10 @@ function parseFrontmatter(content: string): {
   };
 }
 
-// ============================================================
-// FILE SYSTEM
-// ============================================================
-
 async function ensureDirectories(): Promise<void> {
-  await mkdir(AI_OFFICE, {
-    recursive: true,
-  });
+  await mkdir(AI_OFFICE, { recursive: true });
 
-  await mkdir(TASKS_DIR, {
-    recursive: true,
-  });
+  await mkdir(TASKS_DIR, { recursive: true });
 }
 
 async function readTask(filePath: string): Promise<Task> {
@@ -117,6 +127,7 @@ async function findMarkdownFiles(directory: string): Promise<string[]> {
       const nested = await findMarkdownFiles(fullPath);
 
       results.push(...nested);
+
       continue;
     }
 
@@ -127,10 +138,6 @@ async function findMarkdownFiles(directory: string): Promise<string[]> {
 
   return results;
 }
-
-// ============================================================
-// TASK DISCOVERY
-// ============================================================
 
 async function getTasks(): Promise<Task[]> {
   const files = await findMarkdownFiles(TASKS_DIR);
@@ -147,18 +154,46 @@ async function getTasks(): Promise<Task[]> {
 
       tasks.push(task);
     } catch (error) {
-      console.error(`[Orchestrator] Failed to read task: ${file}`, error);
+      console.error(`[Orchestrator] Gagal membaca task: ${file}`, error);
     }
   }
 
   return tasks;
 }
 
-// ============================================================
-// TASK STATUS
-// ============================================================
+function getTaskStatus(task: Task): TaskStatus | null {
+  const status = task.frontmatter.status;
 
-async function updateTaskStatus(task: Task, status: string): Promise<void> {
+  if (!isTaskStatus(status)) {
+    return null;
+  }
+
+  return status;
+}
+
+function getStatusFolder(status: TaskStatus): string {
+  return STATUS_FOLDERS[status];
+}
+
+function getExpectedTaskDirectory(task: Task, status: TaskStatus): string {
+  const project = task.frontmatter.project;
+
+  if (!project) {
+    throw new Error(`Task ${task.frontmatter.id} tidak memiliki project`);
+  }
+
+  return path.join(TASKS_DIR, project, getStatusFolder(status));
+}
+
+function getExpectedTaskPath(task: Task, status: TaskStatus): string {
+  const directory = getExpectedTaskDirectory(task, status);
+
+  const fileName = path.basename(task.path);
+
+  return path.join(directory, fileName);
+}
+
+async function updateTaskStatus(task: Task, status: TaskStatus): Promise<void> {
   const content = await readFile(task.path, "utf8");
 
   const updated = content.replace(/^status:\s*.*$/m, `status: ${status}`);
@@ -168,9 +203,114 @@ async function updateTaskStatus(task: Task, status: string): Promise<void> {
   task.frontmatter.status = status;
 }
 
-// ============================================================
-// DEPENDENCY
-// ============================================================
+async function moveTaskToStatus(task: Task, status: TaskStatus): Promise<Task> {
+  const targetDirectory = getExpectedTaskDirectory(task, status);
+
+  const targetPath = getExpectedTaskPath(task, status);
+
+  const currentPath = path.resolve(task.path);
+
+  const resolvedTarget = path.resolve(targetPath);
+
+  await mkdir(targetDirectory, { recursive: true });
+
+  /*
+   * Kalau file sudah berada di folder
+   * yang sesuai, cukup pastikan statusnya benar.
+   */
+  if (currentPath === resolvedTarget) {
+    await updateTaskStatus(task, status);
+
+    return {
+      ...task,
+      frontmatter: {
+        ...task.frontmatter,
+        status,
+      },
+    };
+  }
+
+  /*
+   * Jangan menimpa file task lain
+   * kalau target sudah ada.
+   */
+  try {
+    await access(targetPath);
+
+    throw new Error(`File task tujuan sudah ada: ${targetPath}`);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.startsWith("File task tujuan sudah ada:")
+    ) {
+      throw error;
+    }
+  }
+
+  const oldFolder = path.basename(path.dirname(task.path));
+
+  await updateTaskStatus(task, status);
+
+  await rename(task.path, targetPath);
+
+  console.log(
+    `[Orchestrator] ${task.frontmatter.id}: ${oldFolder} -> ${getStatusFolder(status)}`,
+  );
+
+  return {
+    ...task,
+    path: targetPath,
+    frontmatter: {
+      ...task.frontmatter,
+      status,
+    },
+  };
+}
+
+/**
+ * Memastikan lokasi file sesuai dengan status task.
+ *
+ * Contoh:
+ *
+ * status: todo
+ * -> Tasks/<project>/TODO/
+ *
+ * status: in-progress
+ * -> Tasks/<project>/IN-PROGRESS/
+ *
+ * status: review
+ * -> Tasks/<project>/REVIEW/
+ *
+ * dst.
+ */
+async function syncTaskLocations(tasks: Task[]): Promise<Task[]> {
+  const syncedTasks: Task[] = [];
+
+  for (const task of tasks) {
+    const status = getTaskStatus(task);
+
+    if (!status) {
+      console.log(
+        `[Orchestrator] ${task.frontmatter.id} dilewati: status tidak valid "${task.frontmatter.status}"`,
+      );
+
+      continue;
+    }
+
+    try {
+      const syncedTask = await moveTaskToStatus(task, status);
+
+      syncedTasks.push(syncedTask);
+    } catch (error) {
+      console.error(
+        `[Orchestrator] Gagal sinkronisasi ${task.frontmatter.id}`,
+        error,
+      );
+    }
+  }
+
+  return syncedTasks;
+}
 
 async function areDependenciesDone(
   task: Task,
@@ -189,7 +329,7 @@ async function areDependenciesDone(
 
     if (!dependency) {
       console.log(
-        `[Orchestrator] ${task.frontmatter.id} waiting: dependency ${dependencyId} not found`,
+        `[Orchestrator] ${task.frontmatter.id} menunggu: dependency ${dependencyId} tidak ditemukan`,
       );
 
       return false;
@@ -197,7 +337,7 @@ async function areDependenciesDone(
 
     if (dependency.frontmatter.status !== "done") {
       console.log(
-        `[Orchestrator] ${task.frontmatter.id} waiting: ${dependencyId} is ${dependency.frontmatter.status}`,
+        `[Orchestrator] ${task.frontmatter.id} menunggu: ${dependencyId} masih ${dependency.frontmatter.status}`,
       );
 
       return false;
@@ -207,10 +347,6 @@ async function areDependenciesDone(
   return true;
 }
 
-// ============================================================
-// WORKER PROMPT
-// ============================================================
-
 function buildWorkerPrompt(task: Task): string {
   const id = task.frontmatter.id ?? "UNKNOWN";
 
@@ -219,49 +355,45 @@ function buildWorkerPrompt(task: Task): string {
   const title = task.frontmatter.title ?? "UNKNOWN";
 
   return `
-You are an AI Office worker.
+Kamu adalah worker dalam AI Office.
 
-You have been assigned this task:
+Kamu mendapatkan task berikut:
 
 Task ID: ${id}
 Project: ${project}
-Title: ${title}
+Judul: ${title}
 
-AI Office root:
+Root AI Office:
 
 ${AI_OFFICE}
 
-Task file:
+File task:
 
 ${task.path}
 
-Follow these instructions:
+Ikuti instruksi berikut:
 
-1. Read the task file.
-2. Read the relevant project documentation.
-3. Read System/Task-Protocol.md.
-4. Verify the task requirement.
-5. Verify the acceptance criteria.
-6. Check task dependencies.
-7. Perform the work required by the task.
-8. Run relevant tests.
-9. Record clear evidence in the task file.
-10. Do not change the requirement silently.
-11. Do not mark the task DONE.
-12. When implementation is complete, change the task status to REVIEW.
+1. Baca file task terlebih dahulu.
+2. Baca dokumentasi project yang relevan.
+3. Baca System/Task-Protocol.md.
+4. Pahami requirement task.
+5. Pahami acceptance criteria.
+6. Periksa dependency task.
+7. Kerjakan pekerjaan sesuai scope task.
+8. Jalankan test yang relevan.
+9. Catat evidence hasil pekerjaan pada file task.
+10. Jangan mengubah requirement secara diam-diam.
+11. Jangan mengubah status menjadi DONE.
+12. Jika implementation selesai, ubah status menjadi REVIEW.
 
-Do not ask the user for instructions.
+Jangan meminta instruksi dari user.
 
-The task file is the communication layer between
-PM, Orchestrator, workers, and QA.
+File task adalah communication layer antara PM,
+Orchestrator, worker, dan QA.
 
-Work only within the scope of this task.
+Kerjakan hanya pekerjaan yang termasuk scope task.
 `.trim();
 }
-
-// ============================================================
-// RUN WORKER
-// ============================================================
 
 async function runWorker(task: Task, agent: Agent): Promise<void> {
   const taskId = task.frontmatter.id;
@@ -271,7 +403,7 @@ async function runWorker(task: Task, agent: Agent): Promise<void> {
   }
 
   if (runningTasks.has(taskId)) {
-    console.log(`[Orchestrator] ${taskId} is already running`);
+    console.log(`[Orchestrator] ${taskId} sedang berjalan`);
 
     return;
   }
@@ -281,14 +413,32 @@ async function runWorker(task: Task, agent: Agent): Promise<void> {
   try {
     console.log("");
     console.log("============================================================");
-    console.log(`[Orchestrator] Starting ${agent}`);
+    console.log(`[Orchestrator] Menjalankan ${agent}`);
     console.log(`[Orchestrator] Task: ${taskId}`);
-    console.log(`[Orchestrator] Title: ${task.frontmatter.title ?? "-"}`);
+    console.log(`[Orchestrator] Judul: ${task.frontmatter.title ?? "-"}`);
     console.log("============================================================");
 
-    // TODO -> IN-PROGRESS
-    await updateTaskStatus(task, "in-progress");
+    const currentStatus = getTaskStatus(task);
 
+    /*
+     * Task baru:
+     *
+     * TODO -> IN-PROGRESS
+     *
+     * Task hasil QA:
+     *
+     * BLOCKED -> IN-PROGRESS
+     */
+    if (currentStatus === "todo") {
+      task = await moveTaskToStatus(task, "in-progress");
+    } else if (currentStatus === "blocked") {
+      task = await moveTaskToStatus(task, "in-progress");
+    }
+
+    /*
+     * Path task bisa berubah setelah dipindahkan,
+     * jadi prompt dibuat setelah proses move.
+     */
     const prompt = buildWorkerPrompt(task);
 
     const workerProcess = Bun.spawn(
@@ -302,55 +452,61 @@ async function runWorker(task: Task, agent: Agent): Promise<void> {
     const exitCode = await workerProcess.exited;
 
     console.log(
-      `[Orchestrator] ${agent} finished ${taskId} with exit code ${exitCode}`,
+      `[Orchestrator] ${agent} selesai mengerjakan ${taskId} dengan exit code ${exitCode}`,
     );
 
+    const latestTask = await readTask(task.path);
+
+    const latestStatus = getTaskStatus(latestTask);
+
     /*
-     * Worker harus mengubah:
+     * Worker gagal.
      *
-     * IN-PROGRESS -> REVIEW
-     *
-     * Worker tidak boleh mengubah:
-     *
-     * REVIEW -> DONE
+     * Kalau masih IN-PROGRESS,
+     * kembalikan ke TODO agar bisa
+     * dicoba kembali.
      */
-
     if (exitCode !== 0) {
-      try {
-        const latestTask = await readTask(task.path);
-
-        if (latestTask.frontmatter.status === "in-progress") {
-          await updateTaskStatus(latestTask, "todo");
-        }
-      } catch (error) {
-        console.error(`[Orchestrator] Failed to reset ${taskId}`, error);
+      if (latestStatus === "in-progress") {
+        await moveTaskToStatus(latestTask, "todo");
       }
 
-      console.error(`[Orchestrator] Worker failed: ${taskId}`);
+      console.error(`[Orchestrator] Worker gagal: ${taskId}`);
+
+      return;
+    }
+
+    /*
+     * Worker berhasil dan mengubah
+     * status menjadi REVIEW.
+     */
+    if (latestStatus === "review") {
+      await moveTaskToStatus(latestTask, "review");
     }
   } catch (error) {
-    console.error(`[Orchestrator] Worker error: ${taskId}`, error);
+    console.error(`[Orchestrator] Error worker ${taskId}`, error);
 
     try {
       const latestTask = await readTask(task.path);
 
-      if (latestTask.frontmatter.status === "in-progress") {
-        await updateTaskStatus(latestTask, "todo");
+      if (getTaskStatus(latestTask) === "in-progress") {
+        await moveTaskToStatus(latestTask, "todo");
       }
     } catch {
-      // Ignore secondary error
+      // Abaikan error sekunder.
     }
   } finally {
     runningTasks.delete(taskId);
   }
 }
 
-// ============================================================
-// DISPATCH FE / BE
-// ============================================================
-
 async function dispatchTasks(): Promise<void> {
-  const tasks = await getTasks();
+  const rawTasks = await getTasks();
+
+  /*
+   * Pertama sinkronkan status dengan folder.
+   */
+  const tasks = await syncTaskLocations(rawTasks);
 
   for (const task of tasks) {
     const { id, status, assignee } = task.frontmatter;
@@ -359,46 +515,51 @@ async function dispatchTasks(): Promise<void> {
       continue;
     }
 
-    // Only process TODO
-    if (status !== "todo") {
+    /*
+     * Worker bisa mengambil:
+     *
+     * TODO
+     * BLOCKED
+     */
+    if (status !== "todo" && status !== "blocked") {
       continue;
     }
 
-    // Validate assignee
     if (!isAgent(assignee)) {
-      console.log(`[Orchestrator] ${id} skipped: invalid assignee`);
+      console.log(`[Orchestrator] ${id} dilewati: assignee tidak valid`);
 
       continue;
     }
 
-    // QA is handled separately
+    /*
+     * QA punya dispatcher sendiri.
+     */
     if (assignee === "QA") {
       continue;
     }
 
-    // Check dependencies
     const dependenciesDone = await areDependenciesDone(task, tasks);
 
     if (!dependenciesDone) {
       continue;
     }
 
-    // Prevent duplicate execution
     if (runningTasks.has(id)) {
       continue;
     }
 
-    // Start worker
     void runWorker(task, assignee);
   }
 }
 
-// ============================================================
-// DISPATCH QA
-// ============================================================
-
 async function dispatchQA(): Promise<void> {
-  const tasks = await getTasks();
+  const rawTasks = await getTasks();
+
+  /*
+   * Pastikan task REVIEW berada
+   * di folder REVIEW terlebih dahulu.
+   */
+  const tasks = await syncTaskLocations(rawTasks);
 
   for (const task of tasks) {
     const { id, status, assignee } = task.frontmatter;
@@ -407,17 +568,13 @@ async function dispatchQA(): Promise<void> {
       continue;
     }
 
-    /*
-     * QA bekerja setelah FE/BE
-     * masuk REVIEW.
-     */
     if (status !== "review") {
       continue;
     }
 
     /*
-     * Hanya FE dan BE yang
-     * diverifikasi QA.
+     * QA hanya melakukan verification
+     * terhadap implementation FE/BE.
      */
     if (assignee !== "FE" && assignee !== "BE") {
       continue;
@@ -434,57 +591,61 @@ async function dispatchQA(): Promise<void> {
       console.log(
         "============================================================",
       );
-      console.log(`[Orchestrator] Starting QA`);
+      console.log("[Orchestrator] Menjalankan QA");
       console.log(`[Orchestrator] Task: ${id}`);
       console.log(
         "============================================================",
       );
 
-      const prompt = `
-You are the QA worker for AI Office.
+      /*
+       * REVIEW -> QA
+       */
+      const qaTask = await moveTaskToStatus(task, "qa");
 
-Verify this task:
+      const prompt = `
+Kamu adalah QA worker dalam AI Office.
+
+Lakukan verification terhadap task berikut:
 
 Task ID: ${id}
-Project: ${task.frontmatter.project ?? "UNKNOWN"}
-Title: ${task.frontmatter.title ?? "UNKNOWN"}
+Project: ${qaTask.frontmatter.project ?? "UNKNOWN"}
+Judul: ${qaTask.frontmatter.title ?? "UNKNOWN"}
 
-Task file:
+File task:
 
-${task.path}
+${qaTask.path}
 
-AI Office root:
+Root AI Office:
 
 ${AI_OFFICE}
 
-Instructions:
+Instruksi:
 
-1. Read the task.
-2. Read the relevant project documentation.
-3. Read System/Task-Protocol.md.
-4. Verify every acceptance criterion.
-5. Review implementation evidence.
-6. Run relevant tests.
-7. Test the happy path.
-8. Test important edge cases.
-9. Check error handling.
-10. Check regression impact where relevant.
-11. Record QA evidence in the task file.
+1. Baca file task.
+2. Baca dokumentasi project yang relevan.
+3. Baca System/Task-Protocol.md.
+4. Periksa setiap acceptance criteria.
+5. Periksa evidence implementation.
+6. Jalankan test yang relevan.
+7. Test happy path.
+8. Test edge case yang penting.
+9. Periksa error handling.
+10. Periksa kemungkinan regression jika relevan.
+11. Catat evidence hasil QA pada file task.
 
-If PASS:
+Jika PASS:
 
-- change status REVIEW -> QA
-- then change status QA -> DONE
+- ubah status menjadi DONE
 
-If FAIL:
+Jika FAIL:
 
-- change status REVIEW -> BLOCKED
-- document the defect clearly
-- include reproducible evidence
+- ubah status menjadi BLOCKED
+- jelaskan defect dengan jelas
+- sertakan evidence yang bisa direproduksi
 
-Do not change the requirement silently.
-Do not ask the user for instructions.
-Do not implement the feature yourself.
+Jangan mengubah requirement secara diam-diam.
+Jangan meminta instruksi dari user.
+Jangan mengimplementasikan feature.
 `.trim();
 
       const qaProcess = Bun.spawn(
@@ -498,35 +659,68 @@ Do not implement the feature yourself.
       const exitCode = await qaProcess.exited;
 
       console.log(
-        `[Orchestrator] QA finished ${id} with exit code ${exitCode}`,
+        `[Orchestrator] QA selesai ${id} dengan exit code ${exitCode}`,
       );
+
+      const latestTask = await readTask(qaTask.path);
+
+      const latestStatus = getTaskStatus(latestTask);
+
+      /*
+       * Kalau QA process crash/error
+       * dan task masih QA, kembalikan
+       * ke REVIEW agar tidak hilang.
+       */
+      if (exitCode !== 0) {
+        if (latestStatus === "qa") {
+          await moveTaskToStatus(latestTask, "review");
+        }
+
+        return;
+      }
+
+      /*
+       * QA PASS
+       *
+       * QA -> DONE
+       */
+      if (latestStatus === "done") {
+        await moveTaskToStatus(latestTask, "done");
+      }
+
+      /*
+       * QA FAIL
+       *
+       * QA -> BLOCKED
+       */
+      if (latestStatus === "blocked") {
+        await moveTaskToStatus(latestTask, "blocked");
+      }
     } catch (error) {
-      console.error(`[Orchestrator] QA error: ${id}`, error);
+      console.error(`[Orchestrator] Error QA ${id}`, error);
     } finally {
       runningTasks.delete(id);
     }
   }
 }
 
-// ============================================================
-// MAIN TICK
-// ============================================================
-
 async function tick(): Promise<void> {
   try {
     await ensureDirectories();
 
+    /*
+     * Dispatch FE / BE.
+     */
     await dispatchTasks();
 
+    /*
+     * Dispatch QA.
+     */
     await dispatchQA();
   } catch (error) {
-    console.error("[Orchestrator] Tick error:", error);
+    console.error("[Orchestrator] Error pada tick:", error);
   }
 }
-
-// ============================================================
-// MAIN
-// ============================================================
 
 async function main(): Promise<void> {
   console.log("");
@@ -535,16 +729,20 @@ async function main(): Promise<void> {
   console.log("============================================================");
   console.log(`AI Office : ${AI_OFFICE}`);
   console.log(`Tasks     : ${TASKS_DIR}`);
-  console.log(`Poll      : ${POLL_INTERVAL}ms`);
+  console.log(`Polling   : ${POLL_INTERVAL}ms`);
   console.log("============================================================");
   console.log("");
 
   await ensureDirectories();
 
-  // Run immediately
+  /*
+   * Jalankan sekali langsung.
+   */
   await tick();
 
-  // Continue polling
+  /*
+   * Setelah itu polling setiap 5 detik.
+   */
   setInterval(() => {
     void tick();
   }, POLL_INTERVAL);
