@@ -5,6 +5,7 @@ import type { Agent, Task, WorkerResult } from "../types";
 import { findTaskById } from "../task/repository";
 import { moveTaskById } from "../task/state";
 import { buildQAPrompt, buildWorkerPrompt } from "./prompt";
+import { WORKER_MODELS } from "../config";
 
 export const runningTasks = new Set<string>();
 
@@ -48,16 +49,11 @@ CWD   : ${cwd}
     [
       "opencode",
       "run",
-
-      /*
-       * Kita TIDAK menggunakan --model.
-       * Model diambil dari OpenCode config.
-       */
       "--agent",
       agent.toLowerCase(),
-
+      "--model",
+      WORKER_MODELS[agent],
       "--auto",
-
       prompt,
     ],
     {

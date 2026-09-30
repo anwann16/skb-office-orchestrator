@@ -7,6 +7,12 @@ export const AI_OFFICE = path.join(
   "Skb-Ai-Office",
 );
 
+export const WORKER_MODELS = {
+  FE: "jago/je-ds",
+  BE: "jago/je-ds",
+  QA: "jago/je-ds",
+} as const;
+
 export const TASKS_DIR = path.join(AI_OFFICE, "Tasks");
 
 export const PROJECTS_DIR = path.join(AI_OFFICE, "Projects");
