@@ -15,15 +15,52 @@ function getProjectPath(project: string): string {
   return path.join(PROJECTS_ROOT, project.toLowerCase());
 }
 
-function getOpenCodeEnv() {
+function getOpenCodeEnv(projectPath: string) {
   return {
     ...process.env,
+
     PATH: [
       path.join(os.homedir(), ".opencode", "bin"),
       path.join(os.homedir(), ".bun", "bin"),
       process.env.PATH ?? "",
     ].join(":"),
+
+    // Make the intended project directory explicit.
+    PWD: projectPath,
   };
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function buildOpenCodeCommand(
+  projectPath: string,
+  agent: string,
+  model: string,
+  prompt: string,
+): string {
+  return [
+    // Explicitly enter the project before starting OpenCode.
+    `cd -- ${shellQuote(projectPath)}`,
+
+    // Replace bash with OpenCode.
+    `exec ${shellQuote(OPENCODE_PATH)}`,
+
+    "run",
+
+    "--standalone",
+
+    "--agent",
+    shellQuote(agent),
+
+    "--model",
+    shellQuote(model),
+
+    "--auto",
+
+    shellQuote(prompt),
+  ].join(" ");
 }
 
 async function runOpenCode(
@@ -32,36 +69,33 @@ async function runOpenCode(
   prompt: string,
 ): Promise<number> {
   const projectPath = getProjectPath(task.project);
+  const model = WORKER_MODELS[agent];
 
   console.log(`
 ============================================================
 [Worker]
 Agent : ${agent}
 Task  : ${task.id}
-Model : ${WORKER_MODELS[agent]}
+Model : ${model}
 CWD   : ${projectPath}
 ============================================================
 `);
 
-  const workerProcess = Bun.spawn(
-    [
-      OPENCODE_PATH,
-      "run",
-      "--standalone",
-      "--agent",
-      agent.toLowerCase(),
-      "--model",
-      WORKER_MODELS[agent],
-      "--auto",
-      prompt,
-    ],
-    {
-      stdout: "inherit",
-      stderr: "inherit",
-      cwd: projectPath,
-      env: getOpenCodeEnv(),
-    },
+  const command = buildOpenCodeCommand(
+    projectPath,
+    agent.toLowerCase(),
+    model,
+    prompt,
   );
+
+  const workerProcess = Bun.spawn(["/bin/bash", "-lc", command], {
+    cwd: projectPath,
+
+    stdout: "inherit",
+    stderr: "inherit",
+
+    env: getOpenCodeEnv(projectPath),
+  });
 
   return workerProcess.exited;
 }
@@ -80,19 +114,19 @@ export async function runWorker(
 
   try {
     /*
-     * Resolve ulang task berdasarkan ID.
-     * Jangan percaya filePath lama.
+     * Always re-read the task before starting.
+     * The file may have moved or changed since dispatch.
      */
     const latest = await findTaskById(task.id);
 
     if (!latest) {
-      console.log(`[Worker] Task ${task.id} tidak ditemukan`);
+      console.error(`[Worker] Task ${task.id} tidak ditemukan`);
 
       return null;
     }
 
     /*
-     * Worker hanya boleh mengambil TODO/BLOCKED.
+     * Worker hanya boleh mengambil TODO atau BLOCKED.
      */
     if (latest.status !== "todo" && latest.status !== "blocked") {
       console.log(`[Worker] ${task.id} status sekarang ${latest.status}, skip`);
@@ -100,42 +134,39 @@ export async function runWorker(
       return null;
     }
 
+    /*
+     * Orchestrator owns task lifecycle.
+     *
+     * Worker tidak boleh mengubah status sendiri.
+     */
     await moveTaskById(task.id, "in-progress");
 
-    /*
-     * Resolve lagi setelah state transition.
-     */
     const workerTask = await findTaskById(task.id);
 
     if (!workerTask) {
-      console.log(`[Worker] Task ${task.id} hilang setelah IN-PROGRESS`);
+      console.error(`[Worker] Task ${task.id} hilang setelah IN-PROGRESS`);
 
       return null;
     }
 
+    /*
+     * Build prompt menggunakan task yang sudah berada
+     * pada state IN-PROGRESS.
+     */
     const prompt = buildWorkerPrompt(workerTask, agent);
 
     const exitCode = await runOpenCode(workerTask, agent, prompt);
 
-    console.log(
-      `[Orchestrator] ${agent} selesai mengerjakan ${task.id} dengan exit code ${exitCode}`,
-    );
-
     /*
-     * PENTING:
+     * Re-read task setelah worker selesai.
      *
-     * Jangan readTask(workerTask.filePath).
-     *
-     * Worker mungkin sudah mengubah:
-     *
-     * IN-PROGRESS → REVIEW
-     *
-     * sehingga filePath lama sudah tidak ada.
+     * Jangan menggunakan object task lama karena task
+     * mungkin sudah berubah/moved.
      */
     const updatedTask = await findTaskById(task.id);
 
     if (!updatedTask) {
-      console.log(
+      console.error(
         `[Worker] Task ${task.id} tidak ditemukan setelah worker selesai`,
       );
 
@@ -147,22 +178,32 @@ export async function runWorker(
     }
 
     /*
-     * Worker berhasil dan sudah mengubah status
-     * menjadi REVIEW.
+     * Orchestrator menentukan hasil berdasarkan exit code.
+     *
+     * Worker TIDAK boleh menentukan REVIEW/ TODO sendiri.
      */
-    if (exitCode === 0 && updatedTask.status === "review") {
-      /*
-       * findTaskById() sudah menemukan lokasi terbaru.
-       * moveTaskById() tidak menggunakan path lama.
-       */
-      await moveTaskById(task.id, "review");
-    }
+    if (exitCode === 0) {
+      if (updatedTask.status === "in-progress") {
+        await moveTaskById(task.id, "review");
 
-    /*
-     * Worker crash sebelum mengubah status.
-     */
-    if (exitCode !== 0 && updatedTask.status === "in-progress") {
-      await moveTaskById(task.id, "todo");
+        console.log(`[Worker] ${task.id} → REVIEW`);
+      } else {
+        console.log(
+          `[Worker] ${task.id} selesai dengan exit 0, ` +
+            `tetapi status sudah ${updatedTask.status}`,
+        );
+      }
+    } else {
+      if (updatedTask.status === "in-progress") {
+        await moveTaskById(task.id, "todo");
+
+        console.log(`[Worker] ${task.id} gagal (exit ${exitCode}) → TODO`);
+      } else {
+        console.log(
+          `[Worker] ${task.id} gagal dengan exit ${exitCode}, ` +
+            `tetapi status sudah ${updatedTask.status}`,
+        );
+      }
     }
 
     return {
@@ -170,6 +211,24 @@ export async function runWorker(
       agent,
       exitCode,
     };
+  } catch (error) {
+    console.error(`[Worker] Error pada ${task.id}:`, error);
+
+    /*
+     * Kalau process/orchestrator error sebelum lifecycle
+     * selesai, coba kembalikan task ke TODO.
+     */
+    try {
+      const latest = await findTaskById(task.id);
+
+      if (latest?.status === "in-progress") {
+        await moveTaskById(task.id, "todo");
+      }
+    } catch (recoveryError) {
+      console.error(`[Worker] Gagal recovery task ${task.id}:`, recoveryError);
+    }
+
+    return null;
   } finally {
     runningTasks.delete(task.id);
   }
@@ -185,80 +244,75 @@ export async function runQA(task: Task): Promise<WorkerResult | null> {
   runningTasks.add(task.id);
 
   try {
+    /*
+     * Re-read task sebelum QA.
+     */
     const latest = await findTaskById(task.id);
 
     if (!latest) {
-      console.log(`[QA] Task ${task.id} tidak ditemukan`);
+      console.error(`[QA] Task ${task.id} tidak ditemukan`);
 
       return null;
     }
-
-    if (latest.status !== "review") {
-      console.log(`[QA] ${task.id} status ${latest.status}, bukan REVIEW`);
-
-      return null;
-    }
-
-    await moveTaskById(task.id, "qa");
 
     /*
-     * Resolve ulang setelah REVIEW → QA.
+     * QA hanya boleh mengambil REVIEW.
      */
+    if (latest.status !== "review") {
+      console.log(`[QA] ${task.id} status sekarang ${latest.status}, skip`);
+
+      return null;
+    }
+
+    /*
+     * Orchestrator memindahkan REVIEW → QA.
+     *
+     * QA agent sendiri tidak boleh melakukan ini.
+     */
+    await moveTaskById(task.id, "qa");
+
     const qaTask = await findTaskById(task.id);
 
     if (!qaTask) {
-      console.log(`[QA] Task ${task.id} hilang setelah QA state`);
+      console.error(`[QA] Task ${task.id} hilang setelah QA state`);
 
       return null;
     }
 
     const prompt = buildQAPrompt(qaTask);
-
     const projectPath = getProjectPath(qaTask.project);
+
+    const model = WORKER_MODELS.QA;
 
     console.log(`
 ============================================================
 [QA]
 Task  : ${qaTask.id}
-Model : ${WORKER_MODELS.QA}
+Model : ${model}
 CWD   : ${projectPath}
 ============================================================
 `);
 
-    const qaProcess = Bun.spawn(
-      [
-        OPENCODE_PATH,
-        "run",
-        "--standalone",
-        "--agent",
-        "qa",
-        "--model",
-        WORKER_MODELS.QA,
-        "--auto",
-        prompt,
-      ],
-      {
-        stdout: "inherit",
-        stderr: "inherit",
-        cwd: projectPath,
-        env: getOpenCodeEnv(),
-      },
-    );
+    const command = buildOpenCodeCommand(projectPath, "qa", model, prompt);
+
+    const qaProcess = Bun.spawn(["/bin/bash", "-lc", command], {
+      cwd: projectPath,
+
+      stdout: "inherit",
+      stderr: "inherit",
+
+      env: getOpenCodeEnv(projectPath),
+    });
 
     const exitCode = await qaProcess.exited;
 
-    console.log(
-      `[Orchestrator] QA selesai ${task.id} dengan exit code ${exitCode}`,
-    );
-
     /*
-     * Jangan menggunakan qaTask.filePath.
-     * Cari lokasi terbaru berdasarkan ID.
+     * Re-read task setelah QA selesai.
      */
     const updatedTask = await findTaskById(task.id);
 
     if (!updatedTask) {
-      console.log(`[QA] Task ${task.id} tidak ditemukan setelah QA selesai`);
+      console.error(`[QA] Task ${task.id} tidak ditemukan setelah QA selesai`);
 
       return {
         taskId: task.id,
@@ -267,19 +321,34 @@ CWD   : ${projectPath}
       };
     }
 
-    if (exitCode !== 0 && updatedTask.status === "qa") {
-      /*
-       * QA crash → kembali REVIEW
-       */
-      await moveTaskById(task.id, "review");
-    }
+    /*
+     * QA result ditentukan oleh exit code.
+     *
+     * exit 0 = PASS
+     * exit != 0 = FAIL
+     */
+    if (exitCode === 0) {
+      if (updatedTask.status === "qa") {
+        await moveTaskById(task.id, "done");
 
-    if (exitCode === 0 && updatedTask.status === "done") {
-      await moveTaskById(task.id, "done");
-    }
+        console.log(`[QA] ${task.id} PASS → DONE`);
+      } else {
+        console.log(
+          `[QA] ${task.id} PASS (exit 0), ` +
+            `tetapi status sudah ${updatedTask.status}`,
+        );
+      }
+    } else {
+      if (updatedTask.status === "qa") {
+        await moveTaskById(task.id, "blocked");
 
-    if (exitCode === 0 && updatedTask.status === "blocked") {
-      await moveTaskById(task.id, "blocked");
+        console.log(`[QA] ${task.id} FAIL (exit ${exitCode}) → BLOCKED`);
+      } else {
+        console.log(
+          `[QA] ${task.id} FAIL (exit ${exitCode}), ` +
+            `tetapi status sudah ${updatedTask.status}`,
+        );
+      }
     }
 
     return {
@@ -287,6 +356,26 @@ CWD   : ${projectPath}
       agent: "QA",
       exitCode,
     };
+  } catch (error) {
+    console.error(`[QA] Error pada ${task.id}:`, error);
+
+    /*
+     * Recovery:
+     *
+     * Kalau QA crash ketika task masih QA,
+     * kembalikan ke REVIEW supaya bisa dicoba lagi.
+     */
+    try {
+      const latest = await findTaskById(task.id);
+
+      if (latest?.status === "qa") {
+        await moveTaskById(task.id, "review");
+      }
+    } catch (recoveryError) {
+      console.error(`[QA] Gagal recovery task ${task.id}:`, recoveryError);
+    }
+
+    return null;
   } finally {
     runningTasks.delete(task.id);
   }
