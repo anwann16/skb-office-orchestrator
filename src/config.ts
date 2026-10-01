@@ -7,6 +7,8 @@ export const AI_OFFICE = path.join(
   "Skb-Ai-Office",
 );
 
+export const PROJECTS_ROOT = path.join(os.homedir(), "project");
+
 export const WORKER_MODELS = {
   FE: "jago/je-ds",
   BE: "jago/je-ds",
@@ -14,13 +16,9 @@ export const WORKER_MODELS = {
 } as const;
 
 export const TASKS_DIR = path.join(AI_OFFICE, "Tasks");
-
 export const PROJECTS_DIR = path.join(AI_OFFICE, "Projects");
-
 export const SYSTEM_DIR = path.join(AI_OFFICE, "System");
-
 export const TEMPLATES_DIR = path.join(AI_OFFICE, "Templates");
-
 export const POLL_INTERVAL_MS = 5000;
 
 export const STATUS_FOLDERS = {

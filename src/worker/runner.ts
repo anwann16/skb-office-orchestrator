@@ -5,18 +5,25 @@ import type { Agent, Task, WorkerResult } from "../types";
 import { findTaskById } from "../task/repository";
 import { moveTaskById } from "../task/state";
 import { buildQAPrompt, buildWorkerPrompt } from "./prompt";
-import { WORKER_MODELS } from "../config";
+import { PROJECTS_ROOT, WORKER_MODELS } from "../config";
 
 export const runningTasks = new Set<string>();
 
+const OPENCODE_PATH = path.join(os.homedir(), ".opencode", "bin", "opencode");
+
 function getProjectPath(project: string): string {
-  return path.join(
-    os.homedir(),
-    "notes-brain",
-    "Skb-Ai-Office",
-    "Projects",
-    project,
-  );
+  return path.join(PROJECTS_ROOT, project.toLowerCase());
+}
+
+function getOpenCodeEnv() {
+  return {
+    ...process.env,
+    PATH: [
+      path.join(os.homedir(), ".opencode", "bin"),
+      path.join(os.homedir(), ".bun", "bin"),
+      process.env.PATH ?? "",
+    ].join(":"),
+  };
 }
 
 async function runOpenCode(
@@ -26,28 +33,19 @@ async function runOpenCode(
 ): Promise<number> {
   const projectPath = getProjectPath(task.project);
 
-  /*
-   * Kalau project directory belum ada,
-   * OpenCode tetap bisa dijalankan dari AI Office.
-   *
-   * Untuk project sebenarnya, PM seharusnya sudah
-   * membuat Projects/<project>.
-   */
-  const cwd = projectPath;
-
   console.log(`
 ============================================================
 [Worker]
 Agent : ${agent}
 Task  : ${task.id}
-Model : OpenCode config
-CWD   : ${cwd}
+Model : ${WORKER_MODELS[agent]}
+CWD   : ${projectPath}
 ============================================================
 `);
 
   const workerProcess = Bun.spawn(
     [
-      "opencode",
+      OPENCODE_PATH,
       "run",
       "--agent",
       agent.toLowerCase(),
@@ -59,7 +57,8 @@ CWD   : ${cwd}
     {
       stdout: "inherit",
       stderr: "inherit",
-      cwd,
+      cwd: projectPath,
+      env: getOpenCodeEnv(),
     },
   );
 
@@ -218,17 +217,29 @@ export async function runQA(task: Task): Promise<WorkerResult | null> {
 
     console.log(`
 ============================================================
-[Orchestrator] Menjalankan QA
-[Orchestrator] Task: ${qaTask.id}
+[QA]
+Task  : ${qaTask.id}
+Model : ${WORKER_MODELS.QA}
+CWD   : ${projectPath}
 ============================================================
 `);
 
     const qaProcess = Bun.spawn(
-      ["opencode", "run", "--agent", "qa", "--auto", prompt],
+      [
+        OPENCODE_PATH,
+        "run",
+        "--agent",
+        "qa",
+        "--model",
+        WORKER_MODELS.QA,
+        "--auto",
+        prompt,
+      ],
       {
         stdout: "inherit",
         stderr: "inherit",
         cwd: projectPath,
+        env: getOpenCodeEnv(),
       },
     );
 
